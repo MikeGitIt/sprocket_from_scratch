@@ -1,0 +1,28 @@
+{
+  "hello_world_inputs": {
+    "name": "Sprocket User"
+  },
+  
+  "genomic_analysis_inputs": {
+    "sample_fastq": "/data/samples/patient_001.fastq",
+    "sample_id": "PATIENT_001",
+    "quality_threshold": 35,
+    "min_coverage": 15.0
+  },
+  
+  "data_processing_inputs": {
+    "input_data": "/data/raw/dataset_2024.csv",
+    "output_prefix": "processed_2024",
+    "batch_size": 500,
+    "enable_validation": true,
+    "error_threshold": 0.02
+  },
+  
+  "multi_step_analysis_inputs": {
+    "experiment_id": "EXP_2024_001",
+    "raw_data": "/data/experiments/exp_001_raw.tsv",
+    "reference_genome": "GRCh38",
+    "num_threads": 8,
+    "generate_plots": true
+  }
+}
