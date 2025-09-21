@@ -1,16 +1,20 @@
 use super::engine::{TaskExecution, WorkflowExecution, WorkflowStatus};
 use super::task_executor::TaskExecutor;
+use crate::cache::WorkflowCache;
 use crate::error::{Result, SprocketError};
 use crate::parser::{TaskCall, WdlDocument};
 use chrono::Utc;
+use futures::future;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub struct WorkflowExecutor {
     task_executions: Arc<RwLock<HashMap<Uuid, TaskExecution>>>,
     workflow_executions: Arc<RwLock<HashMap<Uuid, WorkflowExecution>>>,
+    cache: Option<Arc<WorkflowCache>>,
 }
 
 impl WorkflowExecutor {
@@ -21,6 +25,31 @@ impl WorkflowExecutor {
         Self {
             task_executions,
             workflow_executions,
+            cache: None,
+        }
+    }
+
+    pub fn new_with_cache(
+        task_executions: Arc<RwLock<HashMap<Uuid, TaskExecution>>>,
+        workflow_executions: Arc<RwLock<HashMap<Uuid, WorkflowExecution>>>,
+        ttl_hours: i64,
+    ) -> Self {
+        Self {
+            task_executions,
+            workflow_executions,
+            cache: Some(Arc::new(WorkflowCache::new(ttl_hours))),
+        }
+    }
+
+    pub fn with_cache(
+        task_executions: Arc<RwLock<HashMap<Uuid, TaskExecution>>>,
+        workflow_executions: Arc<RwLock<HashMap<Uuid, WorkflowExecution>>>,
+        cache: Arc<WorkflowCache>,
+    ) -> Self {
+        Self {
+            task_executions,
+            workflow_executions,
+            cache: Some(cache),
         }
     }
 
@@ -28,15 +57,43 @@ impl WorkflowExecutor {
         &self,
         wdl_document: WdlDocument,
         workflow_name: String,
-        inputs: HashMap<String, serde_json::Value>,
+        mut inputs: HashMap<String, serde_json::Value>,
     ) -> Result<Uuid> {
-        // Find the workflow
         let workflow = wdl_document
             .workflows
             .iter()
             .find(|w| w.name == workflow_name)
             .ok_or_else(|| SprocketError::WorkflowNotFound(workflow_name.clone()))?
             .clone();
+
+        for workflow_input in &workflow.inputs {
+            if !inputs.contains_key(&workflow_input.name) {
+                if let Some(default_value) = &workflow_input.default {
+                    inputs.insert(workflow_input.name.clone(), serde_json::Value::String(default_value.clone()));
+                }
+            }
+        }
+
+        if let Some(cache) = &self.cache {
+            if let Some(cached_result) = cache.get(&workflow_name, &inputs).await {
+                let workflow_id = cached_result.workflow_id;
+                let workflow_execution = WorkflowExecution {
+                    id: workflow_id,
+                    workflow: workflow.clone(),
+                    status: WorkflowStatus::Completed,
+                    inputs: inputs.clone(),
+                    outputs: cached_result.outputs.clone(),
+                    task_executions: Vec::new(),
+                    start_time: Some(cached_result.created_at),
+                    end_time: Some(Utc::now()),
+                };
+
+                let mut execs = self.workflow_executions.write().await;
+                execs.insert(workflow_id, workflow_execution);
+                
+                return Ok(workflow_id);
+            }
+        }
 
         let workflow_id = Uuid::new_v4();
         let mut workflow_execution = WorkflowExecution {
@@ -50,13 +107,11 @@ impl WorkflowExecutor {
             end_time: None,
         };
 
-        // Store initial workflow state
         {
             let mut execs = self.workflow_executions.write().await;
             execs.insert(workflow_id, workflow_execution.clone());
         }
 
-        // Execute the workflow
         let result = self
             .run_workflow(&mut workflow_execution, &wdl_document)
             .await;
@@ -64,13 +119,39 @@ impl WorkflowExecutor {
         // Update final workflow state
         match result {
             Ok(_) => {
-                workflow_execution.status = WorkflowStatus::Completed;
+                let task_executions = self.task_executions.read().await;
+                let any_task_failed = workflow_execution.task_executions.iter()
+                    .any(|task_id| {
+                        task_executions.get(task_id)
+                            .map(|exec| exec.status == super::engine::TaskStatus::Failed)
+                            .unwrap_or(false)
+                    });
+                
+                if any_task_failed {
+                    workflow_execution.status = WorkflowStatus::Failed;
+                } else {
+                    workflow_execution.status = WorkflowStatus::Completed;
+                }
             }
             Err(_) => {
                 workflow_execution.status = WorkflowStatus::Failed;
             }
         }
         workflow_execution.end_time = Some(Utc::now());
+
+        if workflow_execution.status == WorkflowStatus::Completed {
+            if let Some(cache) = &self.cache {
+                if let Err(e) = cache.put(
+                    workflow_id,
+                    workflow_execution.workflow.name.clone(),
+                    &workflow_execution.inputs,
+                    workflow_execution.outputs.clone(),
+                    "Completed".to_string(),
+                ).await {
+                    tracing::warn!("Failed to cache workflow result: {}", e);
+                }
+            }
+        }
 
         {
             let mut execs = self.workflow_executions.write().await;
@@ -88,24 +169,83 @@ impl WorkflowExecutor {
     ) -> Result<()> {
         workflow_execution.status = WorkflowStatus::Running;
 
-        // Execute each task call in sequence
-        for call in &workflow_execution.workflow.calls {
-            let task_id = self
-                .execute_task_call(
-                    call,
-                    wdl_document,
-                    &workflow_execution.inputs,
-                    &workflow_execution.task_executions,
-                )
-                .await?;
+        let mut completed_tasks = Vec::new();
+        let mut remaining_calls = workflow_execution.workflow.calls.clone();
 
-            workflow_execution.task_executions.push(task_id);
+        while !remaining_calls.is_empty() {
+            let mut executable_calls = Vec::new();
+            let mut deferred_calls = Vec::new();
+
+            for call in remaining_calls {
+                if self.can_execute_task(&call, &completed_tasks) {
+                    debug!("Task {} is executable", call.task_name);
+                    executable_calls.push(call);
+                } else {
+                    debug!("Task {} is deferred (waiting for dependencies)", call.task_name);
+                    deferred_calls.push(call);
+                }
+            }
+
+            if executable_calls.is_empty() && !deferred_calls.is_empty() {
+                let mut dep_info = String::from("Circular dependency detected. Deferred calls:\n");
+                for call in &deferred_calls {
+                    dep_info.push_str(&format!("  - {} with inputs: {:?}\n", call.task_name, call.inputs));
+                }
+                return Err(SprocketError::WorkflowExecutionError(dep_info));
+            }
+
+            let task_futures: Vec<_> = executable_calls
+                .iter()
+                .map(|call| {
+                    self.execute_task_call(
+                        call,
+                        wdl_document,
+                        &workflow_execution.inputs,
+                        &completed_tasks,
+                    )
+                })
+                .collect();
+
+            let results = future::join_all(task_futures).await;
+            
+            for result in results {
+                let task_id = result?;
+                completed_tasks.push(task_id);
+                workflow_execution.task_executions.push(task_id);
+            }
+
+            remaining_calls = deferred_calls;
         }
 
-        // Extract workflow outputs
         self.extract_workflow_outputs(workflow_execution).await?;
 
         Ok(())
+    }
+
+    fn can_execute_task(&self, call: &TaskCall, completed_task_ids: &[Uuid]) -> bool {
+        for (_, input_ref) in &call.inputs {
+            if input_ref.contains('.') {
+                if let Some(last_dot) = input_ref.rfind('.') {
+                    let task_ref = &input_ref[..last_dot];
+                    
+                    let mut found = false;
+                    for task_id in completed_task_ids {
+                        if let Ok(executions) = self.task_executions.try_read() {
+                            if let Some(exec) = executions.get(task_id) {
+                                if exec.call_name == task_ref {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !found {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     async fn execute_task_call(
@@ -116,6 +256,10 @@ impl WorkflowExecutor {
         previous_task_ids: &[Uuid],
     ) -> Result<Uuid> {
         // Find the task definition
+        debug!("Looking for task: {} in document with tasks: {:?}", 
+            call.task_name, 
+            wdl_document.tasks.iter().map(|t| &t.name).collect::<Vec<_>>());
+        
         let task = wdl_document
             .tasks
             .iter()
@@ -136,7 +280,8 @@ impl WorkflowExecutor {
 
         // Execute the task
         let task_executor = TaskExecutor::new(self.task_executions.clone());
-        task_executor.execute(task, task_inputs).await
+        let call_name = call.task_name.clone();
+        task_executor.execute(task, call_name, task_inputs).await
     }
 
     async fn resolve_input_value(
@@ -153,17 +298,25 @@ impl WorkflowExecutor {
         // Check if it's a reference to a previous task output (e.g., "task_name.output_name")
         if input_ref.contains('.') {
             let parts: Vec<&str> = input_ref.split('.').collect();
-            if parts.len() == 2 {
-                let task_name = parts[0];
-                let output_name = parts[1];
+            if parts.len() >= 2 {
+                let task_name = if parts.len() == 2 {
+                    parts[0].to_string()
+                } else {
+                    parts[..parts.len()-1].join(".")
+                };
+                let output_name = parts[parts.len()-1];
 
                 // Find the task execution by name
                 let task_executions = self.task_executions.read().await;
                 for task_id in previous_task_ids {
                     if let Some(task_exec) = task_executions.get(task_id) {
-                        if task_exec.task.name == task_name {
+                        debug!("Checking task {} with call_name {} against {}", task_exec.task.name, task_exec.call_name, task_name);
+                        if task_exec.call_name == task_name {
+                            debug!("Found matching task, outputs: {:?}", task_exec.outputs);
                             if let Some(output_value) = task_exec.outputs.get(output_name) {
                                 return Ok(output_value.clone());
+                            } else {
+                                debug!("Output {} not found in task outputs", output_name);
                             }
                         }
                     }
@@ -178,18 +331,28 @@ impl WorkflowExecutor {
         &self,
         workflow_execution: &mut WorkflowExecution,
     ) -> Result<()> {
-        for output in &workflow_execution.workflow.outputs {
-            let value = self
-                .resolve_input_value(
-                    &output.expression,
-                    &workflow_execution.inputs,
-                    &workflow_execution.task_executions,
-                )
-                .await?;
+        let task_executions = self.task_executions.read().await;
+        let all_tasks_succeeded = workflow_execution.task_executions.iter()
+            .all(|task_id| {
+                task_executions.get(task_id)
+                    .map(|exec| exec.status == super::engine::TaskStatus::Completed)
+                    .unwrap_or(false)
+            });
 
-            workflow_execution
-                .outputs
-                .insert(output.name.clone(), serde_json::Value::String(value));
+        if all_tasks_succeeded {
+            for output in &workflow_execution.workflow.outputs {
+                let value = self
+                    .resolve_input_value(
+                        &output.expression,
+                        &workflow_execution.inputs,
+                        &workflow_execution.task_executions,
+                    )
+                    .await?;
+
+                workflow_execution
+                    .outputs
+                    .insert(output.name.clone(), serde_json::Value::String(value));
+            }
         }
 
         Ok(())
@@ -214,6 +377,7 @@ mod tests {
     fn create_test_wdl_document() -> WdlDocument {
         WdlDocument {
             version: Some("1.0".to_string()),
+            imports: vec![],
             tasks: vec![
                 Task {
                     name: "task1".to_string(),
@@ -228,6 +392,7 @@ mod tests {
                         data_type: DataType::String,
                         expression: "stdout()".to_string(),
                     }],
+                    runtime: None,
                 },
                 Task {
                     name: "task2".to_string(),
@@ -242,6 +407,7 @@ mod tests {
                         data_type: DataType::String,
                         expression: "stdout()".to_string(),
                     }],
+                    runtime: None,
                 },
             ],
             workflows: vec![Workflow {
@@ -255,12 +421,12 @@ mod tests {
                     TaskCall {
                         task_name: "task1".to_string(),
                         alias: None,
-                        inputs: vec![("input1".to_string(), "workflow_input".to_string())],
+                        inputs: HashMap::from([("input1".to_string(), "workflow_input".to_string())]),
                     },
                     TaskCall {
                         task_name: "task2".to_string(),
                         alias: None,
-                        inputs: vec![("input2".to_string(), "task1.output1".to_string())],
+                        inputs: HashMap::from([("input2".to_string(), "task1.output1".to_string())]),
                     },
                 ],
                 outputs: vec![TaskOutput {
@@ -331,6 +497,7 @@ mod tests {
 
         let wdl_doc = WdlDocument {
             version: Some("1.0".to_string()),
+            imports: vec![],
             tasks: vec![], // No tasks defined
             workflows: vec![Workflow {
                 name: "broken_workflow".to_string(),
@@ -338,7 +505,7 @@ mod tests {
                 calls: vec![TaskCall {
                     task_name: "missing_task".to_string(),
                     alias: None,
-                    inputs: vec![],
+                    inputs: HashMap::new(),
                 }],
                 outputs: vec![],
             }],
@@ -441,7 +608,9 @@ mod tests {
                 inputs: vec![],
                 command: "echo test".to_string(),
                 outputs: vec![],
+                runtime: None,
             },
+            call_name: "previous_task".to_string(),
             status: TaskStatus::Completed,
             inputs: HashMap::new(),
             outputs: {
@@ -455,6 +624,8 @@ mod tests {
             start_time: None,
             end_time: None,
             exit_code: None,
+            retry_count: 0,
+            errors: Vec::new(),
         };
 
         {
@@ -491,6 +662,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_workflow_caching() {
+        let task_executions = Arc::new(RwLock::new(HashMap::new()));
+        let workflow_executions = Arc::new(RwLock::new(HashMap::new()));
+        let executor = WorkflowExecutor::new_with_cache(
+            task_executions.clone(),
+            workflow_executions.clone(),
+            1,
+        );
+
+        let wdl_document = WdlDocument {
+            version: Some("1.0".to_string()),
+            imports: vec![],
+            tasks: vec![Task {
+                name: "simple_task".to_string(),
+                inputs: vec![TaskInput {
+                    name: "message".to_string(),
+                    data_type: DataType::String,
+                    default: None,
+                }],
+                command: "echo ${message}".to_string(),
+                outputs: vec![TaskOutput {
+                    name: "result".to_string(),
+                    data_type: DataType::String,
+                    expression: "stdout()".to_string(),
+                }],
+                runtime: None,
+            }],
+            workflows: vec![Workflow {
+                name: "CachedWorkflow".to_string(),
+                inputs: vec![TaskInput {
+                    name: "input_message".to_string(),
+                    data_type: DataType::String,
+                    default: None,
+                }],
+                calls: vec![TaskCall {
+                    task_name: "simple_task".to_string(),
+                    alias: None,
+                    inputs: {
+                        let mut inputs = HashMap::new();
+                        inputs.insert("message".to_string(), "input_message".to_string());
+                        inputs
+                    },
+                }],
+                outputs: vec![TaskOutput {
+                    name: "final_result".to_string(),
+                    data_type: DataType::String,
+                    expression: "simple_task.result".to_string(),
+                }],
+            }],
+        };
+
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "input_message".to_string(),
+            serde_json::json!("Hello Cache"),
+        );
+
+        let first_id = executor
+            .execute(wdl_document.clone(), "CachedWorkflow".to_string(), inputs.clone())
+            .await;
+        assert!(first_id.is_ok());
+
+        let second_id = executor
+            .execute(wdl_document, "CachedWorkflow".to_string(), inputs)
+            .await;
+        assert!(second_id.is_ok());
+
+        assert_eq!(first_id.unwrap(), second_id.unwrap());
+
+        let workflow_execs = workflow_executions.read().await;
+        assert_eq!(workflow_execs.len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_workflow_with_multiple_task_dependencies() {
         let task_executions = Arc::new(RwLock::new(HashMap::new()));
         let workflow_executions = Arc::new(RwLock::new(HashMap::new()));
@@ -498,6 +743,7 @@ mod tests {
 
         let wdl_doc = WdlDocument {
             version: Some("1.0".to_string()),
+            imports: vec![],
             tasks: vec![
                 Task {
                     name: "preprocess".to_string(),
@@ -512,6 +758,7 @@ mod tests {
                         data_type: DataType::File,
                         expression: "\"processed.txt\"".to_string(),
                     }],
+                    runtime: None,
                 },
                 Task {
                     name: "analyze".to_string(),
@@ -533,6 +780,7 @@ mod tests {
                         data_type: DataType::File,
                         expression: "\"results.txt\"".to_string(),
                     }],
+                    runtime: None,
                 },
                 Task {
                     name: "summarize".to_string(),
@@ -547,6 +795,7 @@ mod tests {
                         data_type: DataType::String,
                         expression: "stdout()".to_string(),
                     }],
+                    runtime: None,
                 },
             ],
             workflows: vec![Workflow {
@@ -567,23 +816,23 @@ mod tests {
                     TaskCall {
                         task_name: "preprocess".to_string(),
                         alias: None,
-                        inputs: vec![("raw_data".to_string(), "input_file".to_string())],
+                        inputs: HashMap::from([("raw_data".to_string(), "input_file".to_string())]),
                     },
                     TaskCall {
                         task_name: "analyze".to_string(),
                         alias: None,
-                        inputs: vec![
+                        inputs: HashMap::from([
                             ("data".to_string(), "preprocess.processed_data".to_string()),
                             ("threshold".to_string(), "quality_threshold".to_string()),
-                        ],
+                        ]),
                     },
                     TaskCall {
                         task_name: "summarize".to_string(),
                         alias: None,
-                        inputs: vec![(
+                        inputs: HashMap::from([(
                             "analysis_results".to_string(),
                             "analyze.results".to_string(),
-                        )],
+                        )]),
                     },
                 ],
                 outputs: vec![
@@ -644,11 +893,13 @@ mod tests {
 
         let wdl_doc = WdlDocument {
             version: Some("1.0".to_string()),
+            imports: vec![],
             tasks: vec![Task {
                 name: "simple_task".to_string(),
                 inputs: vec![],
                 command: "echo 'test'".to_string(),
                 outputs: vec![],
+                runtime: None,
             }],
             workflows: vec![Workflow {
                 name: "simple_workflow".to_string(),
@@ -656,7 +907,7 @@ mod tests {
                 calls: vec![TaskCall {
                     task_name: "simple_task".to_string(),
                     alias: None,
-                    inputs: vec![],
+                    inputs: HashMap::new(),
                 }],
                 outputs: vec![],
             }],
@@ -690,6 +941,7 @@ mod tests {
 
         let wdl_doc = WdlDocument {
             version: Some("1.0".to_string()),
+            imports: vec![],
             tasks: vec![Task {
                 name: "greeting".to_string(),
                 inputs: vec![TaskInput {
@@ -703,6 +955,7 @@ mod tests {
                     data_type: DataType::String,
                     expression: "stdout()".to_string(),
                 }],
+                runtime: None,
             }],
             workflows: vec![Workflow {
                 name: "hello_workflow".to_string(),
@@ -714,7 +967,7 @@ mod tests {
                 calls: vec![TaskCall {
                     task_name: "greeting".to_string(),
                     alias: None,
-                    inputs: vec![("name".to_string(), "person_name".to_string())],
+                    inputs: HashMap::from([("name".to_string(), "person_name".to_string())]),
                 }],
                 outputs: vec![TaskOutput {
                     name: "greeting_message".to_string(),

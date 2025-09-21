@@ -1,3 +1,4 @@
+pub mod docker_executor;
 pub mod engine;
 pub mod task_executor;
 pub mod workflow_executor;

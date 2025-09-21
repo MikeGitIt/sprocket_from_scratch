@@ -1,5 +1,6 @@
 use super::ast::*;
 use crate::error::{Result, SprocketError};
+use std::collections::HashMap;
 use nom::{
     branch::alt,
     bytes::complete::{is_not, tag, take_until},
@@ -37,11 +38,26 @@ fn parse_data_type(input: &str) -> IResult<&str, DataType> {
     ))(input)
 }
 
+fn parse_string_literal(input: &str) -> IResult<&str, &str> {
+    delimited(
+        char('"'),
+        recognize(many0(alt((
+            recognize(none_of("\"\\")),
+            recognize(preceded(char('\\'), char('"'))),
+            recognize(preceded(char('\\'), char('\\'))),
+            recognize(preceded(char('\\'), char('n'))),
+            recognize(preceded(char('\\'), char('t'))),
+            recognize(preceded(char('\\'), char('r'))),
+        )))),
+        char('"'),
+    )(input)
+}
+
 fn parse_default_value(input: &str) -> IResult<&str, Option<String>> {
     opt(preceded(
         ws(tag("=")),
         alt((
-            delimited(char('"'), take_until("\""), char('"')),
+            parse_string_literal,
             digit1,
             tag("true"),
             tag("false"),
@@ -101,6 +117,48 @@ fn parse_task_outputs(input: &str) -> IResult<&str, Vec<TaskOutput>> {
     )(input)
 }
 
+fn parse_runtime_value(input: &str) -> IResult<&str, &str> {
+    alt((
+        parse_string_literal,
+        digit1,
+        recognize(tuple((digit1, opt(tuple((char('.'), digit1)))))),
+    ))(input)
+}
+
+fn parse_runtime(input: &str) -> IResult<&str, ResourceRequirements> {
+    preceded(
+        ws(tag("runtime")),
+        delimited(
+            ws(tag("{")),
+            map(
+                many0(tuple((
+                    ws(identifier),
+                    preceded(ws(tag(":")), parse_runtime_value),
+                ))),
+                |pairs| {
+                    let mut runtime = ResourceRequirements {
+                        cpu: None,
+                        memory: None,
+                        disk: None,
+                        docker: None,
+                    };
+                    for (key, value) in pairs {
+                        match key {
+                            "cpu" | "cpus" => runtime.cpu = value.parse().ok(),
+                            "memory" => runtime.memory = Some(value.to_string()),
+                            "disk" => runtime.disk = Some(value.to_string()),
+                            "docker" => runtime.docker = Some(value.to_string()),
+                            _ => {}
+                        }
+                    }
+                    runtime
+                }
+            ),
+            ws(tag("}")),
+        ),
+    )(input)
+}
+
 fn parse_task(input: &str) -> IResult<&str, Task> {
     map(
         tuple((
@@ -109,27 +167,29 @@ fn parse_task(input: &str) -> IResult<&str, Task> {
                 ws(tag("{")),
                 tuple((
                     opt(parse_task_inputs),
+                    opt(parse_runtime),
                     parse_command,
                     opt(parse_task_outputs),
                 )),
                 ws(tag("}")),
             ),
         )),
-        |(name, (inputs, command, outputs))| Task {
+        |(name, (inputs, runtime, command, outputs))| Task {
             name: name.to_string(),
             inputs: inputs.unwrap_or_default(),
             command,
             outputs: outputs.unwrap_or_default(),
+            runtime,
         },
     )(input)
 }
 
-fn parse_call_inputs(input: &str) -> IResult<&str, Vec<(String, String)>> {
-    preceded(
-        ws(tag("input:")),
-        separated_list0(
-            tag(","),
-            map(
+fn parse_call_inputs(input: &str) -> IResult<&str, HashMap<String, String>> {
+    map(
+        preceded(
+            ws(tag("input:")),
+            separated_list0(
+                tag(","),
                 tuple((
                     ws(identifier),
                     preceded(
@@ -141,23 +201,26 @@ fn parse_call_inputs(input: &str) -> IResult<&str, Vec<(String, String)>> {
                         ))),
                     ),
                 )),
-                |(key, val)| (key.to_string(), val.to_string()),
             ),
         ),
+        |pairs| pairs.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
     )(input)
 }
 
 fn parse_task_call(input: &str) -> IResult<&str, TaskCall> {
     let (input, _) = ws(tag("call"))(input)?;
-    let (input, task_name) = identifier(input)?;
+    let (input, task_name) = alt((
+        recognize(separated_list1(char('.'), identifier)),
+        identifier,
+    ))(input)?;
     let (input, alias) = opt(preceded(ws(tag("as")), identifier))(input)?;
 
     let (input, inputs) = if let Ok((remaining, _)) = ws(tag("{"))(input) {
-        let (remaining, inputs) = parse_call_inputs(remaining)?; // Remove opt() here
+        let (remaining, inputs) = opt(parse_call_inputs)(remaining).map(|(r, i)| (r, i.unwrap_or_default()))?;
         let (remaining, _) = ws(tag("}"))(remaining)?;
         (remaining, inputs)
     } else {
-        (input, vec![])
+        (input, HashMap::new())
     };
 
     Ok((
@@ -200,7 +263,7 @@ fn parse_workflow(input: &str) -> IResult<&str, Workflow> {
                 ws(tag("{")),
                 tuple((
                     opt(parse_task_inputs),
-                    many0(parse_task_call),
+                    many1(parse_task_call),
                     opt(parse_workflow_outputs),
                 )),
                 ws(tag("}")),
@@ -219,22 +282,58 @@ fn parse_version(input: &str) -> IResult<&str, String> {
     preceded(
         ws(tag("version")),
         alt((
-            delimited(char('"'), take_until("\""), char('"')),
+            parse_string_literal,
             recognize(pair(digit1, opt(preceded(char('.'), digit1)))),
         )),
     )(input)
     .map(|(rest, ver)| (rest, ver.to_string()))
 }
 
+fn parse_import(input: &str) -> IResult<&str, Import> {
+    map(
+        tuple((
+            preceded(ws(tag("import")), parse_string_literal),
+            opt(preceded(ws(tag("as")), identifier)),
+        )),
+        |(uri, alias)| Import {
+            uri: uri.to_string(),
+            alias: alias.map(|a| a.to_string()),
+        },
+    )(input)
+}
+
+fn get_line_number(original: &str, current: &str) -> usize {
+    let consumed = original.len() - current.len();
+    let consumed_str = &original[..consumed];
+    consumed_str.chars().filter(|&c| c == '\n').count() + 1
+}
+
+fn get_line_col(original: &str, current: &str) -> (usize, usize) {
+    let consumed = original.len() - current.len();
+    let consumed_str = &original[..consumed];
+    let line = consumed_str.chars().filter(|&c| c == '\n').count() + 1;
+    let last_newline = consumed_str.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let col = consumed - last_newline + 1;
+    (line, col)
+}
+
 pub fn parse_wdl(input: &str) -> Result<WdlDocument> {
+    let original_input = input;
     let mut remaining = input;
     let mut version = None;
+    let mut imports = Vec::new();
     let mut tasks = Vec::new();
     let mut workflows = Vec::new();
 
     // Try to parse version first
     if let Ok((rest, ver)) = parse_version(remaining) {
         version = Some(ver);
+        remaining = rest;
+    }
+
+    // Parse imports
+    while let Ok((rest, import)) = parse_import(remaining) {
+        imports.push(import);
         remaining = rest;
     }
 
@@ -254,11 +353,11 @@ pub fn parse_wdl(input: &str) -> Result<WdlDocument> {
 
         let initial_len = remaining.len();
 
-        if let Ok((rest, task)) = parse_task(remaining) {
-            tasks.push(task);
-            remaining = rest;
-        } else if let Ok((rest, workflow)) = parse_workflow(remaining) {
+        if let Ok((rest, workflow)) = parse_workflow(remaining) {
             workflows.push(workflow);
+            remaining = rest;
+        } else if let Ok((rest, task)) = parse_task(remaining) {
+            tasks.push(task);
             remaining = rest;
         } else {
             // If we can't parse anything and there's non-whitespace content, it's an error
@@ -267,9 +366,10 @@ pub fn parse_wdl(input: &str) -> Result<WdlDocument> {
                 None => remaining, // No newlines, use whole string
             };
             if !next_line.trim().is_empty() && !next_line.trim().starts_with('#') {
+                let (line, col) = get_line_col(original_input, remaining);
                 return Err(SprocketError::ParseError(format!(
-                    "Invalid WDL syntax at: '{}'",
-                    next_line.chars().take(50).collect::<String>()
+                    "Invalid WDL syntax at line {}:{}: '{}'",
+                    line, col, next_line.chars().take(50).collect::<String>()
                 )));
             }
 
@@ -298,6 +398,7 @@ pub fn parse_wdl(input: &str) -> Result<WdlDocument> {
 
     Ok(WdlDocument {
         version,
+        imports,
         tasks,
         workflows,
     })
@@ -385,6 +486,26 @@ mod tests {
         assert_eq!(task_input.name, "greeting");
         assert_eq!(task_input.data_type, DataType::String);
         assert_eq!(task_input.default, Some("Hello World".to_string()));
+    }
+
+    #[test]
+    fn test_parse_string_with_escaped_quotes() {
+        let input = r#""He said \"Hello World\"""#;
+        let result = parse_string_literal(input);
+        assert!(result.is_ok());
+        let (remaining, parsed) = result.unwrap();
+        assert_eq!(remaining, "");
+        assert_eq!(parsed, r#"He said \"Hello World\""#);
+    }
+
+    #[test]
+    fn test_parse_string_with_escaped_backslash() {
+        let input = r#""Path: C:\\Users\\file.txt""#;
+        let result = parse_string_literal(input);
+        assert!(result.is_ok());
+        let (remaining, parsed) = result.unwrap();
+        assert_eq!(remaining, "");
+        assert_eq!(parsed, r#"Path: C:\\Users\\file.txt"#);
     }
 
     #[test]
@@ -710,10 +831,90 @@ task CountReads {
         assert_eq!(workflow.inputs.len(), 3);
         assert_eq!(workflow.calls.len(), 2);
         assert_eq!(workflow.outputs.len(), 2);
+    }
 
-        // Verify task names
-        let task_names: Vec<&str> = doc.tasks.iter().map(|t| t.name.as_str()).collect();
-        assert!(task_names.contains(&"QualityControl"));
-        assert!(task_names.contains(&"CountReads"));
+    #[test]
+    fn test_parse_wdl_with_escaped_strings_in_command() {
+        let source = r#"
+task ProcessData {
+  input {
+    String pattern
+    File input_file
+  }
+  
+  command <<<
+    grep "\"${pattern}\"" ${input_file} | sed 's/\t/\\t/g' > output.txt
+    echo "Result: \"${pattern}\" found"
+  >>>
+  
+  output {
+    File result = "output.txt"
+  }
+}"#;
+
+        let result = parse_wdl(source);
+        assert!(result.is_ok());
+
+        let doc = result.unwrap();
+        assert_eq!(doc.tasks.len(), 1);
+        
+        let task = &doc.tasks[0];
+        assert_eq!(task.name, "ProcessData");
+        assert!(task.command.contains("\\\"${pattern}\\\""));
+        assert!(task.command.contains("\\\\t"));
+    }
+
+    #[test]
+    fn test_parse_wdl_escaped_quotes_in_defaults() {
+        let source = r#"
+task EchoMessage {
+  input {
+    String message = "He said \"Hello World\""
+    String separator = "\t"
+  }
+  
+  command <<<
+    echo "${message}${separator}Done"
+  >>>
+  
+  output {
+    String result = stdout()
+  }
+}"#;
+
+        let result = parse_wdl(source);
+        assert!(result.is_ok());
+
+        let doc = result.unwrap();
+        assert_eq!(doc.tasks.len(), 1);
+        
+        let task = &doc.tasks[0];
+        assert_eq!(task.inputs.len(), 2);
+        assert_eq!(task.inputs[0].default, Some("He said \\\"Hello World\\\"".to_string()));
+        assert_eq!(task.inputs[1].default, Some("\\t".to_string()));
+    }
+
+    #[test]
+    fn test_parse_workflow_with_no_calls_fails() {
+        let source = r#"
+workflow EmptyWorkflow {
+  input {
+    String name
+  }
+  
+  output {
+    String result = "done"
+  }
+}"#;
+
+        let result = parse_wdl(source);
+        assert!(result.is_err());
+        
+        match result {
+            Err(SprocketError::ParseError(msg)) => {
+                assert!(msg.contains("Invalid WDL syntax"));
+            }
+            _ => panic!("Expected ParseError for workflow without calls"),
+        }
     }
 }

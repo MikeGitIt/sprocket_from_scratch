@@ -1,0 +1,15 @@
+target/
+*.db
+*.db-shm
+*.db-wal
+workflow_workspace/
+examples/
+tests/
+.git/
+.gitignore
+README.md
+CLAUDE.md
+*.json
+*.wdl
+!Cargo.lock
+!Cargo.toml

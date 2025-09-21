@@ -1,0 +1,7 @@
+{
+  "workflow_source": "version 1.0\n\nworkflow SimpleTest {\n  input {\n    String name\n  }\n  \n  call Hello {\n    input: name = name\n  }\n  \n  output {\n    String result = Hello.message\n  }\n}\n\ntask Hello {\n  input {\n    String name\n  }\n  \n  command <<<\n    echo \"Hello ${name}\"\n  >>>\n  \n  output {\n    String message = stdout()\n  }\n}",
+  "workflow_name": "SimpleTest",
+  "inputs": {
+    "name": "World"
+  }
+}

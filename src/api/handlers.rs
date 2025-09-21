@@ -11,8 +11,9 @@ use uuid::Uuid;
 use crate::api::models::*;
 use crate::error::Result;
 use crate::execution::ExecutionEngine;
-use crate::parser::parse_wdl;
+use crate::parser::{parse_wdl, resolve_document_imports};
 use crate::storage::SqliteStore;
+use crate::visualization::WorkflowVisualizer;
 
 pub struct AppState {
     pub engine: ExecutionEngine,
@@ -36,26 +37,54 @@ impl AppState {
 pub async fn submit_workflow(
     State(state): State<Arc<RwLock<AppState>>>,
     Json(payload): Json<SubmitWorkflowRequest>,
-) -> std::result::Result<Json<SubmitWorkflowResponse>, StatusCode> {
+) -> std::result::Result<Json<SubmitWorkflowResponse>, (StatusCode, Json<ErrorResponse>)> {
     info!("Received workflow submission request");
 
     let state = state.read().await;
 
     // Parse the WDL source
-    let wdl_document = match parse_wdl(&payload.workflow_source) {
+    let mut wdl_document = match parse_wdl(&payload.workflow_source) {
         Ok(doc) => doc,
         Err(e) => {
             error!("Failed to parse WDL: {}", e);
-            return Err(StatusCode::BAD_REQUEST);
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid WDL syntax".to_string(),
+                    message: format!("Failed to parse WDL: {}", e),
+                }),
+            ));
         }
     };
 
-    // Find the first workflow (for simplicity)
-    let workflow_name = match wdl_document.workflows.first() {
+    // Resolve imports
+    if let Err(e) = resolve_document_imports(&mut wdl_document, None).await {
+        error!("Failed to resolve imports: {}", e);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Import resolution failed".to_string(),
+                message: format!("Failed to resolve imports: {}", e),
+            }),
+        ));
+    }
+
+    // Check if requested workflow exists
+    let workflow = wdl_document.workflows.iter()
+        .find(|w| w.name == payload.workflow_name)
+        .or_else(|| wdl_document.workflows.first());
+        
+    let workflow_name = match workflow {
         Some(w) => w.name.clone(),
         None => {
-            error!("No workflow found in WDL document");
-            return Err(StatusCode::BAD_REQUEST);
+            error!("Workflow not found: {}", payload.workflow_name);
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Workflow not found".to_string(),
+                    message: format!("Workflow '{}' not found in WDL document", payload.workflow_name),
+                }),
+            ));
         }
     };
 
@@ -66,7 +95,13 @@ pub async fn submit_workflow(
         .await
     {
         error!("Failed to store workflow: {}", e);
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Storage error".to_string(),
+                message: format!("Failed to store workflow: {}", e),
+            }),
+        ));
     }
 
     // Execute the workflow
@@ -78,7 +113,13 @@ pub async fn submit_workflow(
         Ok(id) => id,
         Err(e) => {
             error!("Failed to execute workflow: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Execution error".to_string(),
+                    message: format!("Failed to execute workflow: {}", e),
+                }),
+            ));
         }
     };
 
@@ -93,7 +134,7 @@ pub async fn submit_workflow(
 
     Ok(Json(SubmitWorkflowResponse {
         workflow_id,
-        status: "Running".to_string(),
+        status: "queued".to_string(),
     }))
 }
 
@@ -231,4 +272,42 @@ pub async fn health_check(State(state): State<Arc<RwLock<AppState>>>) -> Json<He
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds: uptime,
     })
+}
+
+pub async fn visualize_workflow(
+    State(state): State<Arc<RwLock<AppState>>>,
+    Json(payload): Json<VisualizeWorkflowRequest>,
+) -> std::result::Result<Json<VisualizeWorkflowResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let wdl_document = parse_wdl(&payload.workflow_source).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Invalid WDL syntax".to_string(),
+                message: format!("Failed to parse WDL: {}", e),
+            }),
+        )
+    })?;
+
+    let workflow = wdl_document
+        .workflows
+        .iter()
+        .find(|w| w.name == payload.workflow_name)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "Workflow not found".to_string(),
+                    message: format!("Workflow '{}' not found in document", payload.workflow_name),
+                }),
+            )
+        })?;
+
+    let dot_graph = WorkflowVisualizer::generate_dot(workflow);
+    let execution_order = WorkflowVisualizer::get_execution_order(workflow);
+
+    Ok(Json(VisualizeWorkflowResponse {
+        workflow_name: workflow.name.clone(),
+        dot_graph,
+        execution_order,
+    }))
 }

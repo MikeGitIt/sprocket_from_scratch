@@ -1,0 +1,7 @@
+{
+  "workflow_source": "version 1.0\n\ntask GoodTask {\n  input {\n    String name\n  }\n  command <<<\n    echo ${name}\n  >>>\n  output {\n    String result = stdout()\n  }\n}\n\nworkflow TestWorkflow {\n  input {\n    String name\n    INVALID TYPE here\n  }\n  \n  call GoodTask {\n    input: name = name\n  }\n  \n  output {\n    String result = GoodTask.result\n  }\n}",
+  "workflow_name": "TestWorkflow",
+  "inputs": {
+    "name": "test"
+  }
+}

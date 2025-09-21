@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DataType {
@@ -25,18 +26,27 @@ pub struct TaskOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceRequirements {
+    pub cpu: Option<f32>,
+    pub memory: Option<String>,
+    pub disk: Option<String>,
+    pub docker: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub name: String,
     pub inputs: Vec<TaskInput>,
     pub command: String,
     pub outputs: Vec<TaskOutput>,
+    pub runtime: Option<ResourceRequirements>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskCall {
     pub task_name: String,
     pub alias: Option<String>,
-    pub inputs: Vec<(String, String)>,
+    pub inputs: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,8 +58,15 @@ pub struct Workflow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Import {
+    pub uri: String,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WdlDocument {
     pub version: Option<String>,
+    pub imports: Vec<Import>,
     pub tasks: Vec<Task>,
     pub workflows: Vec<Workflow>,
 }

@@ -5,6 +5,7 @@ use uuid::Uuid;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SubmitWorkflowRequest {
     pub workflow_source: String,
+    pub workflow_name: String,
     pub inputs: HashMap<String, serde_json::Value>,
 }
 
@@ -77,4 +78,17 @@ pub struct HealthResponse {
 pub struct ErrorResponse {
     pub error: String,
     pub message: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct VisualizeWorkflowRequest {
+    pub workflow_source: String,
+    pub workflow_name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct VisualizeWorkflowResponse {
+    pub workflow_name: String,
+    pub dot_graph: String,
+    pub execution_order: Vec<String>,
 }

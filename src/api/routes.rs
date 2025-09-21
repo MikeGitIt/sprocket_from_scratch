@@ -9,7 +9,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::api::handlers::{
     get_task_status, get_workflow_results, get_workflow_status, health_check, submit_workflow,
-    AppState,
+    visualize_workflow, AppState,
 };
 
 pub fn create_router(app_state: Arc<RwLock<AppState>>) -> Router {
@@ -18,6 +18,7 @@ pub fn create_router(app_state: Arc<RwLock<AppState>>) -> Router {
         .route("/workflows", post(submit_workflow))
         .route("/workflows/:id", get(get_workflow_status))
         .route("/workflows/:id/results", get(get_workflow_results))
+        .route("/workflows/visualize", post(visualize_workflow))
         .route("/tasks/:id", get(get_task_status))
         .layer(
             CorsLayer::new()

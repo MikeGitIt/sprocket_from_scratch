@@ -31,6 +31,12 @@ pub enum SprocketError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("Workflow execution error: {0}")]
+    WorkflowExecutionError(String),
+
+    #[error("Cache error: {0}")]
+    CacheError(String),
 }
 
 pub type Result<T> = std::result::Result<T, SprocketError>;

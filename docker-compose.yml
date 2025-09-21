@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  sprocket:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - sprocket-data:/data
+      - ./workflow_workspace:/app/workflow_workspace
+    environment:
+      - DATABASE_URL=sqlite:/data/sprocket.db
+      - RUST_LOG=sprocket=debug,tower_http=debug
+    restart: unless-stopped
+
+volumes:
+  sprocket-data:

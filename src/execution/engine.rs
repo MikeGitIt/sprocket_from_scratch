@@ -31,6 +31,7 @@ pub enum WorkflowStatus {
 pub struct TaskExecution {
     pub id: Uuid,
     pub task: Task,
+    pub call_name: String,
     pub status: TaskStatus,
     pub inputs: HashMap<String, String>,
     pub outputs: HashMap<String, String>,
@@ -40,6 +41,8 @@ pub struct TaskExecution {
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub exit_code: Option<i32>,
+    pub retry_count: u32,
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,7 +81,8 @@ impl ExecutionEngine {
     }
 
     pub async fn execute_task(&self, task: Task, inputs: HashMap<String, String>) -> Result<Uuid> {
-        self.task_executor.execute(task, inputs).await
+        let call_name = task.name.clone();
+        self.task_executor.execute(task, call_name, inputs).await
     }
 
     pub async fn execute_workflow(

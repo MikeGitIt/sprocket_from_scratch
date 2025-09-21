@@ -1,0 +1,8 @@
+{
+  "workflow_source": "version 1.0\n\nimport \"examples/common_tasks.wdl\" as common\n\nworkflow AnalysisWithImport {\n  input {\n    File raw_data\n    Int quality_threshold = 25\n  }\n  \n  call PrepareData {\n    input:\n      input_file = raw_data\n  }\n  \n  call common.QualityCheck {\n    input:\n      data_file = PrepareData.output_file,\n      threshold = quality_threshold\n  }\n  \n  call common.DataValidation {\n    input:\n      input_file = PrepareData.output_file\n  }\n  \n  call FinalizeResults {\n    input:\n      qc_file = common.QualityCheck.result,\n      validation_file = common.DataValidation.count\n  }\n  \n  output {\n    File qc_result = common.QualityCheck.result\n    File validation = common.DataValidation.count\n    File final_report = FinalizeResults.report\n  }\n}\n\ntask PrepareData {\n  input {\n    File input_file\n  }\n  \n  command <<<\n    echo \"Preparing data from ${input_file}\"\n    cp ${input_file} prepared_data.txt\n  >>>\n  \n  output {\n    File output_file = \"prepared_data.txt\"\n  }\n}\n\ntask FinalizeResults {\n  input {\n    File qc_file\n    File validation_file\n  }\n  \n  command <<<\n    echo \"Finalizing results\"\n    cat ${qc_file} ${validation_file} > final_report.txt\n  >>>\n  \n  output {\n    File report = \"final_report.txt\"\n  }\n}",
+  "workflow_name": "AnalysisWithImport",
+  "inputs": {
+    "raw_data": "/tmp/test.txt",
+    "quality_threshold": 30
+  }
+}

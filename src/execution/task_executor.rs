@@ -1,3 +1,4 @@
+use super::docker_executor::DockerExecutor;
 use super::engine::{TaskExecution, TaskStatus};
 use crate::error::{Result, SprocketError};
 use crate::parser::Task;
@@ -7,22 +8,51 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::RwLock;
+use tokio::time::{sleep, Duration};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub struct TaskExecutor {
     executions: Arc<RwLock<HashMap<Uuid, TaskExecution>>>,
+    max_retries: u32,
+    retry_delay_ms: u64,
 }
 
 impl TaskExecutor {
     pub fn new(executions: Arc<RwLock<HashMap<Uuid, TaskExecution>>>) -> Self {
-        Self { executions }
+        Self { 
+            executions,
+            max_retries: 3,
+            retry_delay_ms: 1000,
+        }
     }
 
-    pub async fn execute(&self, task: Task, inputs: HashMap<String, String>) -> Result<Uuid> {
+    pub fn with_retry_config(
+        executions: Arc<RwLock<HashMap<Uuid, TaskExecution>>>,
+        max_retries: u32,
+        retry_delay_ms: u64,
+    ) -> Self {
+        Self {
+            executions,
+            max_retries,
+            retry_delay_ms,
+        }
+    }
+
+    pub async fn execute(&self, task: Task, call_name: String, mut inputs: HashMap<String, String>) -> Result<Uuid> {
+        for task_input in &task.inputs {
+            if !inputs.contains_key(&task_input.name) {
+                if let Some(default_value) = &task_input.default {
+                    inputs.insert(task_input.name.clone(), default_value.clone());
+                }
+            }
+        }
+        
         let execution_id = Uuid::new_v4();
         let mut execution = TaskExecution {
             id: execution_id,
             task: task.clone(),
+            call_name,
             status: TaskStatus::Queued,
             inputs: inputs.clone(),
             outputs: HashMap::new(),
@@ -32,18 +62,37 @@ impl TaskExecutor {
             start_time: Some(Utc::now()),
             end_time: None,
             exit_code: None,
+            retry_count: 0,
+            errors: Vec::new(),
         };
 
-        // Store initial execution state
         {
             let mut execs = self.executions.write().await;
             execs.insert(execution_id, execution.clone());
         }
 
-        // Execute the task
-        self.run_task(&mut execution).await?;
+        loop {
+            match self.run_task(&mut execution).await {
+                Ok(_) => break,
+                Err(e) if execution.retry_count < self.max_retries && execution.status == TaskStatus::Failed => {
+                    execution.errors.push(format!("Attempt {} failed: {}", execution.retry_count + 1, e));
+                    execution.retry_count += 1;
+                    let delay = Duration::from_millis(self.retry_delay_ms * execution.retry_count as u64);
+                    sleep(delay).await;
+                    execution.status = TaskStatus::Queued;
+                    continue;
+                }
+                Err(e) => {
+                    execution.errors.push(format!("Final attempt failed: {}", e));
+                    {
+                        let mut execs = self.executions.write().await;
+                        execs.insert(execution_id, execution);
+                    }
+                    return Err(e);
+                }
+            }
+        }
 
-        // Update final execution state
         {
             let mut execs = self.executions.write().await;
             execs.insert(execution_id, execution);
@@ -54,28 +103,67 @@ impl TaskExecutor {
 
     async fn run_task(&self, execution: &mut TaskExecution) -> Result<()> {
         execution.status = TaskStatus::Running;
+        info!("Running task: {} with call_name: {}", execution.task.name, execution.call_name);
 
-        // Substitute variables in command
         let command = self.substitute_variables(&execution.task.command, &execution.inputs)?;
         execution.command_executed = Some(command.clone());
 
-        // Execute command
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .output()
-            .await
-            .map_err(|e| SprocketError::CommandFailed(e.to_string()))?;
+        let docker_config = if let Some(runtime) = &execution.task.runtime {
+            if let Some(docker_image) = &runtime.docker {
+                Some(crate::execution::docker_executor::DockerConfig {
+                    image: docker_image.clone(),
+                    volumes: Vec::new(),
+                    environment: HashMap::new(),
+                    working_dir: None,
+                    memory_limit: runtime.memory.clone(),
+                    cpu_limit: runtime.cpu.map(|c| c.to_string()),
+                })
+            } else {
+                None
+            }
+        } else {
+            DockerExecutor::parse_docker_config_from_task(&execution.task)
+        };
 
-        execution.stdout = Some(String::from_utf8_lossy(&output.stdout).to_string());
-        execution.stderr = Some(String::from_utf8_lossy(&output.stderr).to_string());
-        execution.exit_code = output.status.code();
+        let (stdout, stderr, exit_code) = if let Some(config) = docker_config {
+            DockerExecutor::execute_in_container(&config, &command, &execution.inputs).await?
+        } else {
+            // Create a workflow-specific directory if it doesn't exist
+            let workflow_dir = std::path::Path::new("workflow_workspace");
+            if !workflow_dir.exists() {
+                std::fs::create_dir_all(workflow_dir)
+                    .map_err(|e| SprocketError::ExecutionError(format!("Failed to create workspace: {}", e)))?;
+            }
+            
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .current_dir(workflow_dir)
+                .output()
+                .await
+                .map_err(|e| SprocketError::CommandFailed(e.to_string()))?;
+            
+            (
+                String::from_utf8_lossy(&output.stdout).to_string(),
+                String::from_utf8_lossy(&output.stderr).to_string(),
+                output.status.code().unwrap_or(-1)
+            )
+        };
+
+        execution.stdout = Some(stdout);
+        execution.stderr = Some(stderr);
+        execution.exit_code = Some(exit_code);
         execution.end_time = Some(Utc::now());
 
-        if output.status.success() {
+        if exit_code == 0 {
             execution.status = TaskStatus::Completed;
-            // Extract outputs
-            self.extract_outputs(execution)?;
+            info!("Task {} completed, extracting outputs", execution.call_name);
+            if let Err(e) = self.extract_outputs(execution) {
+                error!("Failed to extract outputs for task {}: {}", execution.call_name, e);
+                execution.status = TaskStatus::Failed;
+                return Err(e);
+            }
+            info!("Task {} outputs extracted: {:?}", execution.call_name, execution.outputs);
         } else {
             execution.status = TaskStatus::Failed;
         }
@@ -90,7 +178,6 @@ impl TaskExecutor {
     ) -> Result<String> {
         let mut result = command.to_string();
 
-        // Simple variable substitution using ${var} pattern
         let re = Regex::new(r"\$\{([^}]+)\}")
             .map_err(|e| SprocketError::ExecutionError(e.to_string()))?;
 
@@ -109,7 +196,6 @@ impl TaskExecutor {
     }
 
     fn extract_outputs(&self, execution: &mut TaskExecution) -> Result<()> {
-        // For each output defined in the task, extract its value
         for output in &execution.task.outputs {
             let value = self.evaluate_output_expression(
                 &output.expression,
@@ -128,19 +214,26 @@ impl TaskExecutor {
         stdout: Option<&str>,
         _stderr: Option<&str>,
     ) -> Result<String> {
-        // Simple output expression evaluation
         if expression == "stdout()" {
             Ok(stdout.unwrap_or("").to_string())
         } else if expression.starts_with("\"") && expression.ends_with("\"") {
-            // String literal
-            Ok(expression[1..expression.len() - 1].to_string())
+            let filename = &expression[1..expression.len() - 1];
+            let workspace_path = std::path::Path::new("workflow_workspace").join(filename);
+            if workspace_path.exists() {
+                Ok(filename.to_string())
+            } else if std::path::Path::new(filename).exists() {
+                Ok(std::fs::canonicalize(filename)
+                    .map_err(|e| SprocketError::ExecutionError(format!("Failed to resolve path: {}", e)))?
+                    .to_string_lossy()
+                    .to_string())
+            } else {
+                Ok(filename.to_string())
+            }
         } else if expression.starts_with("read_file(") && expression.ends_with(")") {
-            // Extract filename from read_file() function call
             let filename = expression[10..expression.len() - 1]
                 .trim()
                 .trim_matches('"');
 
-            // Read the actual file
             match std::fs::read_to_string(filename) {
                 Ok(contents) => Ok(contents.trim().to_string()),
                 Err(e) => Err(SprocketError::ExecutionError(format!(
@@ -148,8 +241,9 @@ impl TaskExecutor {
                     filename, e
                 ))),
             }
+        } else if expression == "true" || expression == "false" {
+            Ok(expression.to_string())
         } else {
-            // Assume it's a file path
             Ok(expression.to_string())
         }
     }
@@ -181,6 +275,7 @@ mod tests {
                 data_type: DataType::String,
                 expression: "stdout()".to_string(),
             }],
+            runtime: None,
         }
     }
 
@@ -194,7 +289,7 @@ mod tests {
         inputs.insert("input_file".to_string(), "test.txt".to_string());
         inputs.insert("threshold".to_string(), "25".to_string());
 
-        let execution_id = executor.execute(task, inputs).await;
+        let execution_id = executor.execute(task.clone(), task.name.clone(), inputs).await;
         assert!(execution_id.is_ok());
 
         let exec_id = execution_id.unwrap();
@@ -221,7 +316,7 @@ mod tests {
         // Missing required input_file variable
         inputs.insert("threshold".to_string(), "25".to_string());
 
-        let result = executor.execute(task, inputs).await;
+        let result = executor.execute(task.clone(), task.name.clone(), inputs).await;
         assert!(result.is_err());
 
         match result {
@@ -417,10 +512,11 @@ mod tests {
             inputs: vec![],
             command: "exit 1".to_string(),
             outputs: vec![],
+            runtime: None,
         };
 
         let inputs = HashMap::new();
-        let execution_id = executor.execute(task, inputs).await;
+        let execution_id = executor.execute(task.clone(), task.name.clone(), inputs).await;
         assert!(execution_id.is_ok());
 
         let exec_id = execution_id.unwrap();
@@ -447,10 +543,11 @@ mod tests {
                 data_type: DataType::String,
                 expression: "stdout()".to_string(),
             }],
+            runtime: None,
         };
 
         let inputs = HashMap::new();
-        let execution_id = executor.execute(task, inputs).await;
+        let execution_id = executor.execute(task.clone(), task.name.clone(), inputs).await;
         assert!(execution_id.is_ok());
 
         let exec_id = execution_id.unwrap();
@@ -479,10 +576,11 @@ mod tests {
             inputs: vec![],
             command: "sleep 0.1".to_string(),
             outputs: vec![],
+            runtime: None,
         };
 
         let inputs = HashMap::new();
-        let execution_id = executor.execute(task, inputs).await;
+        let execution_id = executor.execute(task.clone(), task.name.clone(), inputs).await;
         assert!(execution_id.is_ok());
 
         let exec_id = execution_id.unwrap();
@@ -494,9 +592,126 @@ mod tests {
         assert!(exec.start_time.is_some());
         assert!(exec.end_time.is_some());
 
-        // Verify end time is after start time
         let duration = exec.end_time.unwrap() - exec.start_time.unwrap();
         assert!(duration.num_milliseconds() >= 0);
+    }
+
+    #[tokio::test]
+    async fn test_task_retry_on_failure() {
+        let executions = Arc::new(RwLock::new(HashMap::new()));
+        let executor = TaskExecutor::with_retry_config(executions.clone(), 2, 100);
+
+        let task = Task {
+            name: "retry_task".to_string(),
+            inputs: vec![],
+            command: "exit 1".to_string(),
+            outputs: vec![],
+            runtime: None,
+        };
+
+        let inputs = HashMap::new();
+        let execution_id = executor.execute(task.clone(), task.name.clone(), inputs).await;
+        assert!(execution_id.is_ok());
+
+        let exec_id = execution_id.unwrap();
+        let execs = executions.read().await;
+        let execution = execs.get(&exec_id);
+
+        assert!(execution.is_some());
+        let exec = execution.unwrap();
+        assert_eq!(exec.status, TaskStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_task_succeeds_without_retry() {
+        let executions = Arc::new(RwLock::new(HashMap::new()));
+        let executor = TaskExecutor::with_retry_config(executions.clone(), 3, 100);
+
+        let task = Task {
+            name: "success_task".to_string(),
+            inputs: vec![],
+            command: "echo 'Success'".to_string(),
+            outputs: vec![TaskOutput {
+                name: "result".to_string(),
+                data_type: DataType::String,
+                expression: "stdout()".to_string(),
+            }],
+            runtime: None,
+        };
+
+        let inputs = HashMap::new();
+        let execution_id = executor.execute(task.clone(), task.name.clone(), inputs).await;
+        assert!(execution_id.is_ok());
+
+        let exec_id = execution_id.unwrap();
+        let execs = executions.read().await;
+        let execution = execs.get(&exec_id);
+
+        assert!(execution.is_some());
+        let exec = execution.unwrap();
+        assert_eq!(exec.status, TaskStatus::Completed);
+        assert!(exec.outputs.contains_key("result"));
+    }
+
+    #[tokio::test]
+    async fn test_task_execution_with_docker() {
+        let docker_available = match DockerExecutor::check_docker_available().await {
+            Ok(available) => available,
+            Err(_) => false,
+        };
+        
+        if !docker_available {
+            return;
+        }
+
+        let executions = Arc::new(RwLock::new(HashMap::new()));
+        let executor = TaskExecutor::new(executions.clone());
+
+        let task = Task {
+            name: "docker_task".to_string(),
+            inputs: vec![TaskInput {
+                name: "message".to_string(),
+                data_type: DataType::String,
+                default: None,
+            }],
+            command: r#"#DOCKER: image=alpine:latest
+echo "Docker says: ${message}"
+"#.to_string(),
+            outputs: vec![TaskOutput {
+                name: "result".to_string(),
+                data_type: DataType::String,
+                expression: "stdout()".to_string(),
+            }],
+            runtime: Some(crate::parser::ResourceRequirements {
+                cpu: None,
+                memory: None,
+                disk: None,
+                docker: Some("alpine:latest".to_string()),
+            }),
+        };
+
+        let mut inputs = HashMap::new();
+        inputs.insert("message".to_string(), "Hello from test".to_string());
+
+        let execution_id = executor.execute(task.clone(), task.name.clone(), inputs).await;
+        assert!(execution_id.is_ok());
+
+        let exec_id = match execution_id {
+            Ok(id) => id,
+            Err(_) => return,
+        };
+        
+        let execs = executions.read().await;
+        let execution = execs.get(&exec_id);
+
+        assert!(execution.is_some());
+        
+        if let Some(exec) = execution {
+            assert_eq!(exec.status, TaskStatus::Completed);
+            if let Some(stdout) = &exec.stdout {
+                assert!(stdout.contains("Docker says: Hello from test"));
+            }
+        }
     }
 
     #[tokio::test]
@@ -530,10 +745,11 @@ mod tests {
                     expression: format!("read_file(\"{}\")", count_file.display()),
                 },
             ],
+            runtime: None,
         };
 
         let inputs = HashMap::new();
-        let execution_id = executor.execute(task, inputs).await;
+        let execution_id = executor.execute(task.clone(), task.name.clone(), inputs).await;
 
         // Clean up
         std::fs::remove_file(count_file).unwrap();

@@ -1,0 +1,7 @@
+{
+  "workflow_source": "version 1.0\n\nworkflow TestWorkflow {\n  input {\n    String name\n  }\n  \n  call InvalidSyntax {\n    this is invalid syntax\n  }\n  \n  output {\n    String result = InvalidSyntax.output\n  }\n}",
+  "workflow_name": "TestWorkflow",
+  "inputs": {
+    "name": "test"
+  }
+}

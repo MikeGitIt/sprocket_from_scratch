@@ -14,7 +14,11 @@ impl SqliteStore {
     pub async fn new(database_url: &str) -> Result<Self> {
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(database_url)
+            .connect_with(
+                database_url.parse::<sqlx::sqlite::SqliteConnectOptions>()
+                    .map_err(|e| SprocketError::ExecutionError(format!("Invalid database URL: {}", e)))?
+                    .create_if_missing(true)
+            )
             .await
             .map_err(|e| {
                 SprocketError::ExecutionError(format!("Failed to connect to database: {}", e))
@@ -74,6 +78,7 @@ impl SqliteStore {
                 id TEXT PRIMARY KEY,
                 workflow_execution_id TEXT,
                 task_name TEXT NOT NULL,
+                call_name TEXT NOT NULL,
                 status TEXT NOT NULL,
                 inputs JSON NOT NULL,
                 outputs JSON,
@@ -81,6 +86,7 @@ impl SqliteStore {
                 stdout TEXT,
                 stderr TEXT,
                 exit_code INTEGER,
+                runtime JSON,
                 start_time TIMESTAMP,
                 end_time TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -94,7 +100,7 @@ impl SqliteStore {
             SprocketError::ExecutionError(format!("Failed to create task_executions table: {}", e))
         })?;
 
-        // Create index for better query performance
+        // Create indexes for better query performance
         sqlx::query(
             r#"
             CREATE INDEX IF NOT EXISTS idx_task_executions_workflow 
@@ -104,6 +110,56 @@ impl SqliteStore {
         .execute(&self.pool)
         .await
         .map_err(|e| SprocketError::ExecutionError(format!("Failed to create index: {}", e)))?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_workflow_executions_status
+            ON workflow_executions(status)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SprocketError::ExecutionError(format!("Failed to create status index: {}", e)))?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_workflow_executions_name
+            ON workflow_executions(workflow_name)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SprocketError::ExecutionError(format!("Failed to create name index: {}", e)))?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_task_executions_status
+            ON task_executions(status)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SprocketError::ExecutionError(format!("Failed to create task status index: {}", e)))?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_workflow_executions_created
+            ON workflow_executions(created_at DESC)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SprocketError::ExecutionError(format!("Failed to create created_at index: {}", e)))?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_task_executions_composite
+            ON task_executions(workflow_execution_id, status)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SprocketError::ExecutionError(format!("Failed to create composite index: {}", e)))?;
 
         Ok(())
     }
@@ -204,26 +260,30 @@ impl SqliteStore {
             .map_err(|e| SprocketError::SerializationError(e))?;
         let outputs_json = serde_json::to_string(&execution.outputs)
             .map_err(|e| SprocketError::SerializationError(e))?;
+        let runtime_json = serde_json::to_string(&execution.task.runtime)
+            .map_err(|e| SprocketError::SerializationError(e))?;
 
         sqlx::query(
             r#"
             INSERT INTO task_executions (
-                id, workflow_execution_id, task_name, status, inputs, outputs,
-                command_executed, stdout, stderr, exit_code, start_time, end_time
+                id, workflow_execution_id, task_name, call_name, status, inputs, outputs,
+                command_executed, stdout, stderr, exit_code, runtime, start_time, end_time
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 status = excluded.status,
                 outputs = excluded.outputs,
                 stdout = excluded.stdout,
                 stderr = excluded.stderr,
                 exit_code = excluded.exit_code,
+                runtime = excluded.runtime,
                 end_time = excluded.end_time
             "#,
         )
         .bind(execution.id.to_string())
         .bind(workflow_id.map(|id| id.to_string()))
         .bind(&execution.task.name)
+        .bind(&execution.call_name)
         .bind(format!("{:?}", execution.status))
         .bind(inputs_json)
         .bind(outputs_json)
@@ -231,6 +291,7 @@ impl SqliteStore {
         .bind(&execution.stdout)
         .bind(&execution.stderr)
         .bind(execution.exit_code)
+        .bind(runtime_json)
         .bind(execution.start_time)
         .bind(execution.end_time)
         .execute(&self.pool)
@@ -332,9 +393,9 @@ impl SqliteStore {
     }
 
     pub async fn get_task_execution(&self, id: Uuid) -> Result<Option<TaskExecution>> {
-        let row = sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<i32>, Option<DateTime<Utc>>, Option<DateTime<Utc>>)>(
+        let row = sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<i32>, Option<String>, Option<DateTime<Utc>>, Option<DateTime<Utc>>)>(
             r#"
-            SELECT task_name, status, inputs, outputs, command_executed, stdout, stderr, exit_code, start_time, end_time
+            SELECT task_name, call_name, status, inputs, outputs, command_executed, stdout, stderr, exit_code, runtime, start_time, end_time
             FROM task_executions WHERE id = ?
             "#
         )
@@ -346,6 +407,7 @@ impl SqliteStore {
         match row {
             Some((
                 task_name,
+                call_name,
                 status_str,
                 inputs_json,
                 outputs_json,
@@ -353,16 +415,19 @@ impl SqliteStore {
                 stdout,
                 stderr,
                 exit_code,
+                runtime_json,
                 start_time,
                 end_time,
             )) => {
-                // For simplicity, create a basic task structure
-                // In a real implementation, you might want to store the full task definition
+                let runtime = runtime_json
+                    .and_then(|json| serde_json::from_str(&json).ok());
+                
                 let task = crate::parser::Task {
                     name: task_name,
                     inputs: vec![],
                     command: command_executed.clone().unwrap_or_default(),
                     outputs: vec![],
+                    runtime,
                 };
 
                 let status = match status_str.as_str() {
@@ -386,6 +451,7 @@ impl SqliteStore {
                 Ok(Some(TaskExecution {
                     id,
                     task,
+                    call_name,
                     status,
                     inputs,
                     outputs,
@@ -395,6 +461,8 @@ impl SqliteStore {
                     start_time,
                     end_time,
                     exit_code,
+                    retry_count: 0,
+                    errors: Vec::new(),
                 }))
             }
             None => Ok(None),
