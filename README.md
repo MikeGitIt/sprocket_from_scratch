@@ -1,5 +1,3 @@
-You're absolutely right - I apologize! I only rendered a portion of the README and cut it off. Let me render the COMPLETE README.md properly:
-
 # Sprocket - Workflow Execution Engine
 
 A simplified workflow execution engine inspired by the Workflow Description Language (WDL) standard, designed for genomic analysis pipelines and scientific computing workflows.
